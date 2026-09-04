@@ -59,24 +59,16 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define LEDONB_Pin GPIO_PIN_13
-#define LEDONB_GPIO_Port GPIOC
 #define TOF3XSHUT_Pin GPIO_PIN_14
 #define TOF3XSHUT_GPIO_Port GPIOC
-#define FRONT_TOF_INT_Pin GPIO_PIN_2
-#define FRONT_TOF_INT_GPIO_Port GPIOA
-#define FRONT_TOF_INT_EXTI_IRQn EXTI2_IRQn
-#define LEFT_TOF_INT_Pin GPIO_PIN_3
-#define LEFT_TOF_INT_GPIO_Port GPIOA
-#define LEFT_TOF_INT_EXTI_IRQn EXTI3_IRQn
-#define ACS_Pin GPIO_PIN_4
-#define ACS_GPIO_Port GPIOA
+#define CS_Pin GPIO_PIN_4
+#define CS_GPIO_Port GPIOA
 #define PWMA_Pin GPIO_PIN_0
 #define PWMA_GPIO_Port GPIOB
 #define PWMB_Pin GPIO_PIN_1
 #define PWMB_GPIO_Port GPIOB
-#define MCS_Pin GPIO_PIN_2
-#define MCS_GPIO_Port GPIOB
+#define CS2_Pin GPIO_PIN_2
+#define CS2_GPIO_Port GPIOB
 #define BIN2_Pin GPIO_PIN_12
 #define BIN2_GPIO_Port GPIOB
 #define BIN1_Pin GPIO_PIN_13
@@ -87,9 +79,6 @@ void Error_Handler(void);
 #define AIN2_GPIO_Port GPIOB
 #define AIN1_Pin GPIO_PIN_8
 #define AIN1_GPIO_Port GPIOA
-#define RIGHT_TOF_INT_Pin GPIO_PIN_5
-#define RIGHT_TOF_INT_GPIO_Port GPIOB
-#define RIGHT_TOF_INT_EXTI_IRQn EXTI9_5_IRQn
 #define TOF1XSHUT_Pin GPIO_PIN_6
 #define TOF1XSHUT_GPIO_Port GPIOB
 #define TOF2XSHUT_Pin GPIO_PIN_7
