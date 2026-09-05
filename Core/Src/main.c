@@ -203,7 +203,9 @@ DMA_HandleTypeDef hdma_usart1_tx;
 DMA_HandleTypeDef hdma_usart1_rx;
 
 /* USER CODE BEGIN PV */
-#define DWT_CTRL (*(volatile uint32_t*) 0XE0001000)
+#define CoreDebug_DEMCR (*(volatile uint32_t*) 0xE000EDFC)
+#define DWT_CTRL        (*(volatile uint32_t*) 0xE0001000)
+#define DWT_CYCCNT      (*(volatile uint32_t*) 0xE0001004)
 
 uint16_t distance;
 volatile bool use_usb_logging = false;
@@ -284,13 +286,15 @@ static bool hysteresis_update(bool latched, float value, float threshold, float 
 static float rate_limit(float target, float prev, float max_step);
 static float wrap_angle_rad(float angle);
 static float front_speed_scale(float front_mm);
-
+uint32_t get_us(void);
+void DWT_Init(void);
 
 
 // FreeRTOS METHODS
 static void tof_task(void *parameters);
 static void main_task(void *parameters);
 static void imu_task(void *parameters);
+
 //void vPID_task(void *parameters);
 static void xOrientationCheckTask(void *parameters);
 void vMotorController(void *parameters);
@@ -309,13 +313,28 @@ static void vJoystickTask(void *parameters);
 //    return len;
 //}
 int _write(int file, char *ptr, int len) {
+    // 1. Generate the timestamp header string
+    char header[32];
+    int h_len = snprintf(header, sizeof(header), "[%lu us] ", get_us());
+
+    // 2. Combine header and message into a single buffer to prevent interleaving
+    #define MAX_LOG_LEN 256
+    char combined[MAX_LOG_LEN];
+
+    // Truncate payload if it exceeds the local buffer size
+    int payload_len = (len < (int)(MAX_LOG_LEN - h_len - 1)) ? len : (int)(MAX_LOG_LEN - h_len - 1);
+
+    memcpy(combined, header, h_len);
+    memcpy(combined + h_len, ptr, payload_len);
+    int total_len = h_len + payload_len;
+
     if (use_usb_logging) {
         // --- USB CDC Logging ---
         uint8_t status = USBD_BUSY;
         uint8_t retries = 0;
 
         do {
-            status = CDC_Transmit_FS((uint8_t *)ptr, len);
+            status = CDC_Transmit_FS((uint8_t *)combined, total_len);
             if (status == USBD_BUSY) {
                 vTaskDelay(pdMS_TO_TICKS(1)); // Yield to other tasks
                 retries++;
@@ -327,11 +346,25 @@ int _write(int file, char *ptr, int len) {
         while (huart1.gState == HAL_UART_STATE_BUSY_TX) {
             vTaskDelay(pdMS_TO_TICKS(1));
         }
-//        HAL_UART_Transmit_DMA(&huart1, (uint8_t *)ptr, len);
-            HAL_UART_Transmit(&huart1, (uint8_t *)ptr, (uint16_t)len, 10);
-
+        HAL_UART_Transmit(&huart1, (uint8_t *)combined, (uint16_t)total_len, 10);
     }
-    return len;
+
+    return len; // Return original length so standard library tracking stays accurate
+}
+
+void DWT_Init(void) {
+    // 1. Enable TRCENA (Trace Enable) in CoreDebug DEMCR register
+    CoreDebug_DEMCR |= (1 << 24);
+
+    // 2. Reset the cycle counter
+    DWT_CYCCNT = 0;
+
+    // 3. Enable the CYCCNT (Cycle Counter) bit in DWT Control register
+    DWT_CTRL |= (1 << 0);
+}
+
+uint32_t get_us(void) {
+    return (uint32_t)(DWT_CYCCNT / (SystemCoreClock / 1000000));
 }
 
 /* --------------------------------------------------------------------------
@@ -379,7 +412,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  DWT_Init();
   /* USER CODE END Init */
 
   /* Configure the system clock */
