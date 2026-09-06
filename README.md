@@ -1,5 +1,8 @@
 # Heuristic-01 - Autonomous Mazesolving Robot
-<img src="https://github.com/user-attachments/assets/18340c36-3ac3-4ed2-8062-c1b23e79f355" width="500"/>
+
+<img src="https://github.com/user-attachments/assets/18340c36-3ac3-4ed2-8062-c1b23e79f355" width="360"/>
+
+<img width="476" height="360" alt="gifheuristic" src="https://github.com/user-attachments/assets/ba580f9e-31a7-4238-9db8-246dba9c609e" />
 
 ## Hardware Architecture
 * **Microcontroller:** STM32 (configured via STM32CubeIDE)
