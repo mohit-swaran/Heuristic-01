@@ -85,8 +85,8 @@
       <site name="imu_site" 
             type="box"
             pos="0.0295 -0.0515 0.07150" 
-            quat="0.707107 0.707107 0 0" 
-            size="0.013 0.0008 0.014"/>
+            quat="1 0 0 0" 
+            size="0.014 0.014 0.0008 "/>
 
       <!-- Front ToF Site -->
       <site name="tof_front_site" 
