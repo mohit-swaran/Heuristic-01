@@ -5,6 +5,7 @@ import time
 # Import third-party libraries
 from IPython.display import clear_output
 import mujoco
+import math
 import mujoco.viewer
 
 # Dynamically resolve root project directory
@@ -16,8 +17,8 @@ MOTOR_SPEED_LIMIT = 1.0    # Speed limit range [-1.0, 1.0]
 PRINT_EVERY = 50           # Sim loop iterations before printing sensor readings
 
 # Corrected Actuator names (matching heuristic01_simple.xml)
-LEFT_MOTOR = "left_wheel_motor"
-RIGHT_MOTOR = "right_wheel_motor"
+LEFT_MOTOR = "left_motor"
+RIGHT_MOTOR = "right_motor"
 
 # Sensor names (matching MJCF file)
 IMU_ACCEL = "imu_accel"
@@ -123,7 +124,10 @@ with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as vie
             tof_right = data.sensor(TOF_RIGHT).data
             tof_left = data.sensor(TOF_LEFT).data
             tof_front = data.sensor(TOF_FRONT).data
-
+            mag_x = data.sensor(IMU_MAG).data[0]
+            mag_y = data.sensor(IMU_MAG).data[1]
+            yaw = -math.atan2(mag_y, mag_x)
+            
             clear_output(wait=True)
             print(f"Accel:       {accel}")
             print(f"Gyro:        {gyro}")
@@ -136,6 +140,8 @@ with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as vie
             print(f"TOF right:   {tof_right}")
             print(f"TOF left:    {tof_left}")
             print(f"TOF front:   {tof_front}")
+            print(f"Yaw:         {yaw:.3f} rad, {math.degrees(yaw):.1f} deg")
+
 
         # Sync loop iteration speed with physics timestep
         slack = model.opt.timestep - (time.time() - step_start)
