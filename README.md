@@ -1,5 +1,8 @@
 # Heuristic-01 - Autonomous Mazesolving Robot
-<img src="https://github.com/user-attachments/assets/18340c36-3ac3-4ed2-8062-c1b23e79f355" width="500"/>
+
+<img src="https://github.com/user-attachments/assets/18340c36-3ac3-4ed2-8062-c1b23e79f355" width="360"/>
+
+<img width="476" height="360" alt="gifheuristic" src="https://github.com/user-attachments/assets/ba580f9e-31a7-4238-9db8-246dba9c609e" />
 
 ## Hardware Architecture
 * **Microcontroller:** STM32 (configured via STM32CubeIDE)
@@ -14,3 +17,24 @@
 * **Wireless Joystick Control:** Joystick inputs are captured on a host laptop and transmitted over the internet/Wi-Fi to the ESP-01.
 * **Serial Bridging:** `esp-link` receives the network packets and forwards the control commands directly to the STM32's UART interface.
 * **Real-Time Feedback:** Simultaneously streams telemetry data back through the same bridge for performance monitoring and debugging.
+
+## MuJoCo Implementation
+<img width="1920" height="1052" alt="Screenshot from 2026-09-05 21-38-37" src="https://github.com/user-attachments/assets/4d52ec35-9f9b-489a-8cc8-1d3a42af40ba" />
+
+### Launching the Simulation
+To launch the interactive MuJoCo viewer, run the launcher script from the `RL_workspace` directory so relative asset paths resolve correctly:
+
+```
+cd RL_workspace
+
+# If the virtual environment does not exist,
+# Create a new virtual environment named 'venv'
+python3 -m venv venv
+
+# if virtual environment exists
+# Activate the new environment
+source venv/bin/activate
+
+# Launch simulation viewer
+python3 launcher/simple_mujoco_launcher.py
+```
