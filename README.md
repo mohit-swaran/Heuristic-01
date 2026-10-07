@@ -36,13 +36,6 @@ source venv/bin/activate
 # Launch simulation viewer
 python3 launcher/simple_mujoco_launcher.py
 ```
-=======
-
-Reinforcement Learning 
-Markovs Decision Process
-
-#SAPR
-State - S
 Action - A
 Transition - P
 Reward - R
