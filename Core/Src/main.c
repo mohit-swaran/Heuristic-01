@@ -81,7 +81,7 @@ typedef struct {
 
 
 static PID_Controller_t speed_pid_A = {
-    .Kp = 4.0f,
+    .Kp = 3.5f,
     .Ki = 2.25f,
     .Kd = 0.01f,
 
@@ -102,12 +102,20 @@ static PID_Controller_t speed_pid_B = {
     .max_output = 4799.0f
 };
 
-// 2. HARDCODE THE OPTIMAL LQR GAINS (The K Matrix)
-// These values come from your Python/MATLAB tuning (Q and R matrices).
-// K_y determines how aggressively to fix distance.
-// K_theta determines how aggressively to fix angle.
-float K_y = 0.008f;
-float K_theta = 0.1f;
+// WALL FOLLOWING PID CONTROLLER
+static PID_Controller_t wall_pid = {
+    .Kp = 0.05f,    // Proportional: How aggressively to turn towards the center
+    .Ki = 0.0001f,  // Integral: Closes steady-state gaps
+    .Kd = 0.01f,    // Derivative: Dampens oscillations (acts like heading correction)
+
+    .integral = 0.0f,
+    .prev_error = 0.0f,
+    .max_integral = 2.0f,
+    .max_output = 2.0f // Max turn rate in rad/s
+};
+
+int m = 0; //Moto State
+volatile bool motors_armed = true;
 
 volatile int16_t latest_cntA = 0;
 volatile int16_t latest_cntB = 0;
@@ -224,14 +232,6 @@ typedef enum {
 
 /* ---- Persistent state (static so it survives across loop iters) - */
 
-static bool        s_has_left_latched  = false;
-static bool        s_has_right_latched = false;
-static float        s_y_err_filt        = 0.0f;
-static float        s_prev_omega        = 0.0f;
-static uint8_t       s_front_block_count = 0;
-static nav_state_t  s_nav_state         = NAV_FOLLOWING;
-static int8_t         s_turn_dir          = 1; /* +1 = turn left, -1 = turn right */
-
 
 #define TARGET_WALL_DIST_MM        100.0f
 #define TARGET_HEADING_RAD         0.0f
@@ -266,14 +266,7 @@ static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
-//HAL_StatusTypeDef VL53L0X_WriteReg(uint8_t dev_addr, uint8_t reg, uint8_t value);
-//HAL_StatusTypeDef VL53L0X_WriteReg16(uint8_t reg, uint16_t value);
-//HAL_StatusTypeDef VL53L0X_WriteMulti(uint8_t reg, uint8_t *pData, uint16_t count);
 
-//HAL_StatusTypeDef VL53L0X_ReadReg(uint8_t reg, uint8_t *pValue);
-//HAL_StatusTypeDef VL53L0X_Read16(uint8_t dev_addr, uint8_t reg, uint16_t *pValue);
-//HAL_StatusTypeDef VL53L0X_ReadMulti(uint8_t reg, uint8_t *pData, uint16_t count);
-//HAL_StatusTypeDef VL53L0X_SetI2CAddress(uint8_t current_addr, uint8_t new_7bit_addr);
 
 void VL53L0X_Init_All(void);
 
@@ -282,10 +275,6 @@ void Move_MotorB(int16_t magn);
 float Compute_PID(PID_Controller_t *pid, float error, float dt);
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 void CalcIK(float v, float ang_v, float *ang_R, float *ang_L);
-static bool hysteresis_update(bool latched, float value, float threshold, float hyst);
-static float rate_limit(float target, float prev, float max_step);
-static float wrap_angle_rad(float angle);
-static float front_speed_scale(float front_mm);
 uint32_t get_us(void);
 void DWT_Init(void);
 
@@ -342,13 +331,15 @@ int _write(int file, char *ptr, int len) {
         } while (status == USBD_BUSY && retries < 10); // 10ms timeout
 
     } else {
-        // --- UART DMA Logging ---
-        while (huart1.gState == HAL_UART_STATE_BUSY_TX) {
-            vTaskDelay(pdMS_TO_TICKS(1));
+        // --- UART DMA Logging Fix ---
+        // Forcefully clear a stuck busy state caused by an electrical glitch/timeout
+        if (huart1.gState == HAL_UART_STATE_BUSY_TX) {
+            huart1.gState = HAL_UART_STATE_READY;
+            __HAL_UNLOCK(&huart1);
         }
+
         HAL_UART_Transmit(&huart1, (uint8_t *)combined, (uint16_t)total_len, 10);
     }
-
     return len; // Return original length so standard library tracking stays accurate
 }
 
@@ -446,7 +437,7 @@ int main(void)
     status = xTaskCreate(tof_task, "TOFTask", 512, NULL, 2, &tof_task_handler);
     status = xTaskCreate(imu_task, "IMUTask", 512, NULL, 2, &imu_task_handler);
     status = xTaskCreate(main_task, "MainTask", 512, NULL, 2, &main_task_handler);
-//    status = xTaskCreate(xOrientationCheckTask, "orietationtask", 128, NULL, 2, &orientation_task_handler);
+    status = xTaskCreate(xOrientationCheckTask, "orientationtask", 256, NULL, 1, &orientation_task_handler);
     status = xTaskCreate(vLocalNavigationTask, "MainTask", 512, NULL, 2, &local_navigation_task_handler);
     status = xTaskCreate(vMotorController, "motorCtrl", 512, NULL, 2, &motor_task_handler);
     status = xTaskCreate(vDebugPrintTask, "debug", 256, NULL, 2, &debug_task_handler);
@@ -1173,36 +1164,27 @@ float Compute_PID(PID_Controller_t *pid, float error, float dt)
     return output;
 }
 
-void compute_lqr_velocity(float y_err, float theta_err, float *v_cmd, float *ang_cmd) {
 
+void compute_wall_pid_velocity(float y_err, float dt, float *v_cmd, float *ang_cmd) {
     // 1. SET BASE VELOCITY
-    // The forward speed you want the robot to maintain (e.g., 0.5 m/s
     float v_max = 0.5f;
 
-    // 3. APPLY THE LQR CONTROL LAW: u = -Kx
-    // In our case: steering_correction = (K_y * y_err) + (K_theta * theta_err)
-    float steering_correction = (K_y * y_err) + (K_theta * theta_err);
-//    printf("k_y: %.2f, k_theta: %.2f\r\n", K_y, K_theta);
-    // 4. OUTPUT COMMANDS
+    // 2. APPLY PID CONTROL LAW
+    // Calculate steering correction using the PID controller on the lateral error
+    float steering_correction = Compute_PID(&wall_pid, y_err, dt);
+
+    // 3. OUTPUT COMMANDS
+    // Slow down the forward velocity when the robot needs to make a sharp turn
     float speed_scaling = 1.0f / (1.0f + 2.0f * fabsf(steering_correction));
     float v_ref = v_max * speed_scaling;
 
-        // Optional: Set a minimum floor speed so it doesn't crawl to a complete dead stop
-        if (v_ref < 0.1f) {
-            v_ref = 0.1f;
-        }
+    // Set a minimum floor speed so it doesn't crawl to a complete stop during corrections
+    if (v_ref < 0.3f) {
+        v_ref = 0.3f;
+    }
+
     *v_cmd = v_ref;
-
-    // Target angular velocity is 0 (straight) minus the correction
     *ang_cmd = steering_correction;
-
-    // Optional but recommended: Add saturation limits to prevent
-//    // the LQR from commanding a turn faster than the motors can physically execute
-//    const float MAX_OMEGA = 5.0f; // rad/s
-//    if (*ang_cmd > MAX_OMEGA)  *ang_cmd = MAX_OMEGA;
-//    if (*ang_cmd < -MAX_OMEGA) *ang_cmd = -MAX_OMEGA;
-//
-//    printf("steering: %f,v_cmd: %.2f,ang_cmd: %.2f \n\r", steering_correction, *v_cmd, *ang_cmd);
 }
 
 void vMotorController(void *parameters){
@@ -1213,7 +1195,7 @@ void vMotorController(void *parameters){
     static int32_t prev_cntA = 0;
     static int32_t prev_cntB = 0;
 
-    HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
     HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL);
@@ -1227,32 +1209,49 @@ void vMotorController(void *parameters){
     {
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
-        if (xTaskNotifyWait(0x00, ULONG_MAX, &packed_value, 0) == pdTRUE)
-        {
-            target_ticks_A = (int16_t)(packed_value >> 16);
-            target_ticks_B = (int16_t)(packed_value & 0xFFFF);
-        }
+        if (!motors_armed || is_robot_flipped) {
+                    /* Discard stale targets and prevent PID windup during disarm. */
+                    target_ticks_A = 0;
+                    target_ticks_B = 0;
+                    speed_pid_A.integral = 0.0f;
+                    speed_pid_A.prev_error = 0.0f;
+                    speed_pid_B.integral = 0.0f;
+                    speed_pid_B.prev_error = 0.0f;
 
-        latest_cntA = (int16_t)__HAL_TIM_GET_COUNTER(&htim5);
-        latest_cntB = (int16_t)__HAL_TIM_GET_COUNTER(&htim2);
+                    Move_MotorA(0);
+                    Move_MotorB(0);
+                    HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
 
-        int16_t deltaA = (int16_t)prev_cntA - latest_cntA;
-        int16_t deltaB = (int16_t)prev_cntB - latest_cntB;
+                    /* Keep encoder deltas current while disarmed. */
+                    latest_cntA = (int16_t)__HAL_TIM_GET_COUNTER(&htim5);
+                    latest_cntB = (int16_t)__HAL_TIM_GET_COUNTER(&htim2);
+                    prev_cntA = latest_cntA;
+                    prev_cntB = latest_cntB;
+                    continue;
+                }
 
-        prev_cntA = latest_cntA;
-        prev_cntB = latest_cntB;
+                HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_SET);
 
-        float actual_ticks_A = (float)deltaA / dt;
-        float actual_ticks_B = (float)deltaB / dt;
+                if (xTaskNotifyWait(0x00, ULONG_MAX, &packed_value, 0) == pdTRUE) {
+                    target_ticks_A = (int16_t)(packed_value >> 16);
+                    target_ticks_B = (int16_t)(packed_value & 0xFFFF);
+                }
 
-        float error_A = (float)target_ticks_A - actual_ticks_A;
-        float error_B = (float)target_ticks_B - actual_ticks_B;
+                latest_cntA = (int16_t)__HAL_TIM_GET_COUNTER(&htim5);
+                latest_cntB = (int16_t)__HAL_TIM_GET_COUNTER(&htim2);
 
-        float pwm_A = Compute_PID(&speed_pid_A, error_A, dt);
-        float pwm_B = Compute_PID(&speed_pid_B, error_B, dt);
+                int16_t deltaA = (int16_t)prev_cntA - latest_cntA;
+                int16_t deltaB = (int16_t)prev_cntB - latest_cntB;
+                prev_cntA = latest_cntA;
+                prev_cntB = latest_cntB;
 
-        Move_MotorA((int16_t)pwm_A);
-        Move_MotorB((int16_t)pwm_B);
+                float actual_ticks_A = (float)deltaA / dt;
+                float actual_ticks_B = (float)deltaB / dt;
+                float error_A = (float)target_ticks_A - actual_ticks_A;
+                float error_B = (float)target_ticks_B - actual_ticks_B;
+
+                Move_MotorA((int16_t)Compute_PID(&speed_pid_A, error_A, dt));
+                Move_MotorB((int16_t)Compute_PID(&speed_pid_B, error_B, dt));
 
     }
 }
@@ -1322,282 +1321,124 @@ void vMotorController(void *parameters){
 //        // Print target vs actual speed every 100ms
 ////        if (++print_counter >= 10) {
 ////            print_counter = 0;
-//            printf(">TARGET: %.3f m/s >ACTUAL A: %.3f m/s >ACTUAL B: %.3f m/s >cntA: %lu > cnB: %lu\r\n",
-//                   user_target_speed_ms, actual_speed_A_ms, actual_speed_B_ms, (unsigned long)latest_cntA, (unsigned long)latest_cntB);
-////        }
+////            printf(">TARGET: %.3f m/s >ACTUAL A: %.3f m/s >ACTUAL B: %.3f m/s >cntA: %lu > cnB: %lu\r\n",
+////                   user_target_speed_ms, actual_speed_A_ms, actual_speed_B_ms, (unsigned long)latest_cntA, (unsigned long)latest_cntB);
+//////        }
 //    }
 //}
 
-static bool hysteresis_update(bool latched, float value, float threshold, float hyst)
-{
-    /* Once inside (latched==true), require the value to rise above
-     * threshold+hyst to exit. Once outside, require it to fall below
-     * threshold-hyst to enter. Prevents chatter right at the boundary. */
-    if (latched) {
-        return value < (threshold + hyst);
-    } else {
-        return value < (threshold - hyst);
-    }
-}
-
-static float rate_limit(float target, float prev, float max_step)
-{
-    float d = target - prev;
-    if (d > max_step)  return prev + max_step;
-    if (d < -max_step) return prev - max_step;
-    return target;
-}
-
-static float wrap_angle_rad(float angle)
-{
-    while (angle > M_PI)
-        angle -= 2.0f * M_PI;
-
-    while (angle < -M_PI)
-        angle += 2.0f * M_PI;
-
-    return angle;
-}
-
-static float front_speed_scale(float front_mm)
-{
-    if (front_mm >= 300.0f)
-        return 1.0f;
-
-    if (front_mm <= 100.0f)
-        return 0.0f;
-
-    return (front_mm - 100.0f) / 200.0f;
-}
 
 void vLocalNavigationTask(void *parameters)
 {
-    (void)parameters;
-
     tof_pack_t tof_data;
     imu_pack_t imu_data;
 
+
+    bool last_has_left = false;
     while (system_started == 1) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(40); /* 50Hz nominal (actually ~25Hz at 40ms, matches original) */
+    const TickType_t xFrequency = pdMS_TO_TICKS(40); // 50Hz
+
+//    const float TARGET_WALL_DIST_MM = 100.0f;
+//    const float TARGET_HEADING_RAD = 0.0f;
+//    const float FRONT_OBSTACLE_THRESHOLD_MM = 100.0f; // Stop or slow down if wall is closer than 10cm ahead
+    const float Y_ERR_TOLERANCE_MM = 5.0f;
 
     while (1)
     {
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
-        if (xQueueReceive(xTofQueue, &tof_data, pdMS_TO_TICKS(50)) != pdPASS ||
-            xQueueReceive(xImuQueue, &imu_data, pdMS_TO_TICKS(50)) != pdPASS)
+        // Safe 50ms timeout to prevent locking up the loop
+        if (xQueueReceive(xTofQueue, &tof_data, pdMS_TO_TICKS(50)) == pdPASS &&
+            xQueueReceive(xImuQueue, &imu_data, pdMS_TO_TICKS(50)) == pdPASS)
         {
-            /* No fresh data this tick - skip rather than act on stale/garbage data. */
-            continue;
+            float current_yaw_rad = imu_data.heading * (M_PI / 180.0f);
+            float y_left_tof = tof_data.y_left;
+            float y_right_tof = tof_data.y_right;
+            float x_front_tof = tof_data.x_front; // <--- Your new center sensor data!
+
+            // 1. Heading & Lateral Error Calculation
+            float theta_err = TARGET_HEADING_RAD - current_yaw_rad;
+
+            bool has_left = last_has_left
+                ? (y_left_tof < WALL_THRESHOLD_MM + 20.0f)   // stay locked in
+                : (y_left_tof < WALL_THRESHOLD_MM - 20.0f);  // harder to enter
+            last_has_left = has_left;
+
+            float y_err = 0.0f;
+            y_err = y_right_tof - y_left_tof;
+
+			if (y_err > Y_ERR_TOLERANCE_MM) {
+				y_err -= Y_ERR_TOLERANCE_MM;
+			} else if (y_err < -Y_ERR_TOLERANCE_MM) {
+				y_err += Y_ERR_TOLERANCE_MM;
+			} else {
+				y_err = 0.0f;
+			}
+
+            // 2. Compute normal PID velocity and steering
+            float v_cmd, omega_cmd;
+            compute_wall_pid_velocity(y_err, 0.020f, &v_cmd, &omega_cmd);
+
+            // 4. Inverse Kinematics & Motor Execution
+            float ang_R, ang_L;
+            CalcIK(v_cmd, omega_cmd, &ang_R, &ang_L);
+
+            int16_t target_ticks_A = METERS_TO_TICKS(ang_R);
+            int16_t target_ticks_B = METERS_TO_TICKS(ang_L);
+
+            uint32_t packed_value = ((uint32_t)(uint16_t)target_ticks_A << 16) | (uint16_t)target_ticks_B;
+            xTaskNotify(motor_task_handler, packed_value, eSetValueWithOverwrite);
+
+            printf("%.1f,%.1f,%.1f,%.2f,%.,%.2f,%.2f,%.2f,%lu,%lu\n\r ",
+                                      y_left_tof, x_front_tof, y_right_tof, y_err, theta_err, v_cmd, omega_cmd, (unsigned long)latest_cntA, (unsigned long)latest_cntB);
         }
-
-        float current_yaw_rad = imu_data.heading * (M_PI / 180.0f);
-        float y_left_tof  = tof_data.y_left;
-        float y_right_tof = tof_data.y_right;
-        float x_front_tof = tof_data.x_front;
-
-        /* --- 1. Heading error --- */
-        float theta_err = wrap_angle_rad(TARGET_HEADING_RAD - current_yaw_rad);
-
-        /* --- 2. Wall presence with hysteresis --- */
-        bool has_left  = hysteresis_update(s_has_left_latched,  y_left_tof,  WALL_THRESHOLD_MM, WALL_HYSTERESIS_MM);
-        bool has_right = hysteresis_update(s_has_right_latched, y_right_tof, WALL_THRESHOLD_MM, WALL_HYSTERESIS_MM);
-        s_has_left_latched  = has_left;
-        s_has_right_latched = has_right;
-
-        /* --- 3. Lateral error, mode-selected --- */
-        float y_err = 0.0f;
-//        if (has_left && has_right) {
-//            /* Both walls: center between them. */
-//            y_err = y_right_tof - y_left_tof;
-//        } else
-//        if (has_left) {
-//            y_err = TARGET_WALL_DIST_MM - y_left_tof;
-//        } else
-        if (has_right) {
-            y_err = TARGET_WALL_DIST_MM - y_right_tof;
-        }
-        /* else: no walls in range, y_err stays 0 (drive straight on heading only) */
-
-        /* Low-pass filter to smooth sensor noise / residual mode-switch jump. */
-        s_y_err_filt = Y_ERR_FILTER_ALPHA * y_err + (1.0f - Y_ERR_FILTER_ALPHA) * s_y_err_filt;
-
-        /* --- 4. Front obstacle debounce --- */
-        if (x_front_tof < FRONT_OBSTACLE_THRESHOLD_MM) {
-            if (s_front_block_count < 255) s_front_block_count++;
-        } else {
-            s_front_block_count = 0;
-        }
-        bool front_blocked = (s_front_block_count >= FRONT_BLOCK_DEBOUNCE_COUNT);
-
-        /* --- 5. Nav state machine (Pure wall-following / straight driving without turns) --- */
-        float v_cmd, omega_cmd;
-
-        // Always compute regular tracking velocity/steering
-        compute_lqr_velocity(s_y_err_filt, theta_err, &v_cmd, &omega_cmd);
-
-        // If front is blocked, force navigation state to tracking mode,
-        // but front_speed_scale will naturally zero out the speed anyway.
-        s_nav_state = NAV_FOLLOWING;
-
-        float front_scale = front_speed_scale(x_front_tof);
-//        v_cmd *= front_scale;
-
-        /* --- 6. Saturate + slew-rate limit omega before it reaches motors --- */
-        if (omega_cmd > MAX_OMEGA)  omega_cmd = MAX_OMEGA;
-        if (omega_cmd < -MAX_OMEGA) omega_cmd = -MAX_OMEGA;
-
-        omega_cmd = rate_limit(omega_cmd, s_prev_omega, MAX_OMEGA_STEP);
-        s_prev_omega = omega_cmd;
-
-        /* --- 7. Inverse kinematics + motor execution --- */
-        float ang_R, ang_L;
-
-        CalcIK(v_cmd, omega_cmd, &ang_R, &ang_L);
-
-        int16_t target_ticks_A = METERS_TO_TICKS(ang_R);
-        int16_t target_ticks_B = METERS_TO_TICKS(ang_L);
-
-        uint32_t packed_value = ((uint32_t)(uint16_t)target_ticks_A << 16) | (uint16_t)target_ticks_B;
-        xTaskNotify(motor_task_handler, packed_value, eSetValueWithOverwrite);
-
-        /* Debug */
-         printf("state:%d | l:%.1f f:%.1f r:%.1f | y_err:%.2f(filt:%.2f) th_err:%.2f | v:%.2f w:%.2f | cntA: %lu | cntB: %lu\n\r ",
-                s_nav_state, y_left_tof, x_front_tof, y_right_tof, y_err, s_y_err_filt, theta_err, v_cmd, omega_cmd, (unsigned long)latest_cntA, (unsigned long)latest_cntB);
     }
 }
-
-//void vLocalNavigationTask(void *parameters)
-//{
-//    tof_pack_t tof_data;
-//    imu_pack_t imu_data;
-//
-//    int last_has_left;
-//    while (system_started == 1) {
-//        vTaskDelay(pdMS_TO_TICKS(50));
-//    }
-//
-//    TickType_t xLastWakeTime = xTaskGetTickCount();
-//    const TickType_t xFrequency = pdMS_TO_TICKS(40); // 50Hz
-//
-//    const float TARGET_WALL_DIST_MM = 100.0f;
-//    const float TARGET_HEADING_RAD = 0.0f;
-//    const float FRONT_OBSTACLE_THRESHOLD_MM = 100.0f; // Stop or slow down if wall is closer than 10cm ahead
-//
-//    while (1)
-//    {
-//        vTaskDelayUntil(&xLastWakeTime, xFrequency);
-//
-//        // Safe 50ms timeout to prevent locking up the loop
-//        if (xQueueReceive(xTofQueue, &tof_data, pdMS_TO_TICKS(50)) == pdPASS &&
-//            xQueueReceive(xImuQueue, &imu_data, pdMS_TO_TICKS(50)) == pdPASS)
-//        {
-//            float current_yaw_rad = imu_data.heading * (M_PI / 180.0f);
-//            float y_left_tof = tof_data.y_left;
-//            float y_right_tof = tof_data.y_right;
-//            float x_front_tof = tof_data.x_front; // <--- Your new center sensor data!
-//
-//            // 1. Heading & Lateral Error Calculation
-//            float theta_err = TARGET_HEADING_RAD - current_yaw_rad;
-//
-//            bool has_left = last_has_left
-//                ? (y_left_tof < WALL_THRESHOLD_MM + 20.0f)   // stay locked in
-//                : (y_left_tof < WALL_THRESHOLD_MM - 20.0f);  // harder to enter
-//            last_has_left = has_left;
-//
-//
-////            y_err = y_right_tof - y_left_tof;
-//            float y_err = 0.0f;
-//
-////            if (has_left && has_right) {
-////                y_err = y_right_tof - y_left_tof;
-//////                printf("Both walls\n\r");
-////            } else
-//            if (has_left) {
-//                y_err = TARGET_WALL_DIST_MM - y_left_tof;
-////                printf("LEft wall\n\r");
-//            } else if (has_right) {
-//                y_err = y_right_tof - TARGET_WALL_DIST_MM;
-////                printf("right Wall\n\r");
-//            }
-//
-////            printf("tof_l: %f | tof_f: %f | tof_r: %f | y_err: %f\n", y_left_tof, x_front_tof, y_right_tof,y_err);
-//
-//            // 2. Compute normal LQR velocity and steering
-//            float v_cmd, omega_cmd;
-//            compute_lqr_velocity(y_err, theta_err, &v_cmd, &omega_cmd);
-//
-//            // 3. FRONT OBSTACLE OVERRIDE (Using your new center sensor)
-//            if (x_front_tof < FRONT_OBSTACLE_THRESHOLD_MM) {
-//                // If a wall is directly ahead, force forward velocity to zero
-//                // (or handle a turn/maze rotation here)
-//                v_cmd = 0.0f;
-//            }
-//
-//            // 4. Inverse Kinematics & Motor Execution
-//            float ang_R, ang_L;
-//            CalcIK(v_cmd, omega_cmd, &ang_R, &ang_L);
-//
-//            int16_t target_ticks_A = METERS_TO_TICKS(ang_R);
-//            int16_t target_ticks_B = METERS_TO_TICKS(ang_L);
-//
-//            uint32_t packed_value = ((uint32_t)(uint16_t)target_ticks_A << 16) | (uint16_t)target_ticks_B;
-//            xTaskNotify(motor_task_handler, packed_value, eSetValueWithOverwrite);
-//        }
-//    }
-//}
 
 
 static void xOrientationCheckTask(void *parameters)
 {
     imu_pack_t imu_data;
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(50); // Check at 20Hz
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(50);
+    const uint8_t debounce_samples = 5;
+    uint8_t upside_down_count = 0;
+    uint8_t upright_count = 0;
 
-    while (1)
-    {
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    for (;;) {
+        vTaskDelayUntil(&last_wake, period);
+        if (xQueuePeek(xImuQueue, &imu_data, 0) != pdPASS) {
+            continue;
+        }
 
-        // Peek or receive from xImuQueue without blocking indefinitely
-        if (xQueuePeek(xImuQueue, &imu_data, portMAX_DELAY) == pdPASS)
-        {
-            // When upright, Z-axis acceleration points down against gravity (+9.81 m/s^2).
-            // When upside down (flipped), Z-axis acceleration becomes negative (approx -9.81 m/s^2).
-            // Threshold set at -5.0 m/s^2 to reliably catch a flip.
-            if (imu_data.acc[2] < -6.0f && !is_robot_flipped)
-            {
+        if (imu_data.acc[2] < -7.0f) {
+            upright_count = 0;
+            if (upside_down_count < debounce_samples) {
+                upside_down_count++;
+            }
+            if (upside_down_count >= debounce_samples && !is_robot_flipped) {
                 is_robot_flipped = true;
-
-                // 1. Suspend the navigation task
-                if (local_navigation_task_handler != NULL) {
-                    vTaskSuspend(local_navigation_task_handler);
-                }
-
-                // 2. Hardware cutoff: Kill the motor driver instantly via Standby pin
-                HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
-
-                // 3. Print debug statement
-                printf(">>> ROBOT FLIPPED! Z-Accel: %.2f m/s^2 (Negative G). Navigation Suspended & Motors Killed. <<<\r\n", imu_data.acc[2]);
+                motors_armed = false;
+                printf(">>> ROBOT Disarmed (Flip Confirmed). <<<\r\n");
+                printf("Motor State: %d",m);
             }
-            else if (imu_data.acc[2] >= -6.0f && is_robot_flipped)
-            {
+        } else if (imu_data.acc[2] > 7.0f) {
+            upside_down_count = 0;
+            if (upright_count < debounce_samples) {
+                upright_count++;
+            }
+            if (upright_count >= debounce_samples && is_robot_flipped) {
+                /* Clear the sensed flip only; explicit M,1 is still required. */
                 is_robot_flipped = false;
-
-                // 1. Resume the navigation task
-                if (local_navigation_task_handler != NULL) {
-                    vTaskResume(local_navigation_task_handler);
-                }
-
-                // 2. Restore hardware standby pin
-                HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_SET);
-
-                // 3. Print debug statement
-                printf(">>> Robot upright. Z-Accel: %.2f m/s^2. Navigation Resumed & Motors Restored. <<<\r\n", imu_data.acc[2]);
+                printf(">>> Robot upright. Press emergency release to re-arm. <<<\r\n");
             }
+        } else {
+            upside_down_count = 0;
+            upright_count = 0;
         }
     }
 }
@@ -1607,8 +1448,6 @@ void CalcIK(float v, float ang_v, float *ang_R, float *ang_L){
 	*ang_R = (v + (ang_v * CHASSIS_LENGTH / 2.0)) ;
 	*ang_L = (v - (ang_v * CHASSIS_LENGTH / 2.0));
 }
-
-
 
 static void main_task(void *parameters){
     char local_rx_buffer[32];
@@ -1621,83 +1460,115 @@ static void main_task(void *parameters){
 
             // --- JOYSTICK MODE TOGGLE: "J,1" (ON) or "J,0" (OFF) ---
             if (sscanf(local_rx_buffer, "J,%d", &m) == 1) {
-                if (m == 1 && !joystick_mode) {
-                    joystick_mode = true;
+                if (m == 1) {
+                    if (!joystick_mode) {
+                        joystick_mode = true;
+                        if (local_navigation_task_handler != NULL) vTaskSuspend(local_navigation_task_handler);
+                        if (joystick_task_handler == NULL) xTaskCreate(vJoystickTask, "JoystickTask", 512, NULL, 2, &joystick_task_handler);
+                        else vTaskResume(joystick_task_handler);
 
-                    // 1. Suspend autonomous navigation
-                    if (local_navigation_task_handler != NULL) {
-                        vTaskSuspend(local_navigation_task_handler);
-
-                    }
-
-                    // 2. Create or Resume Joystick Task
-                    if (joystick_task_handler == NULL) {
-                        xTaskCreate(vJoystickTask, "JoystickTask", 512, NULL, 2, &joystick_task_handler);
+                        uint32_t zero_pack = 0;
+                        xTaskNotify(motor_task_handler, zero_pack, eSetValueWithOverwrite);
+                        printf(">>> Joystick Mode ENABLED. Navigation Suspended. <<<\r\n");
                     } else {
-                        vTaskResume(joystick_task_handler);
-
+                        printf(">>> Joystick Mode is ALREADY Enabled. <<<\r\n");
                     }
-                    uint32_t zero_pack = 0;
-                    xTaskNotify(motor_task_handler, zero_pack, eSetValueWithOverwrite);
-                    printf(">>> Joystick Mode ENABLED. Navigation Suspended. <<<\r\n");
                 }
-                else if (m == 0 && joystick_mode) {
-                    joystick_mode = false;
-
-                    // 1. Suspend Joystick Task
-                    if (joystick_task_handler != NULL) {
-                        vTaskSuspend(joystick_task_handler);
-
+                else if (m == 0) {
+                    if (joystick_mode) {
+                        joystick_mode = false;
+                        if (joystick_task_handler != NULL) vTaskSuspend(joystick_task_handler);
+                        if (local_navigation_task_handler != NULL) vTaskResume(local_navigation_task_handler);
+                        printf(">>> Joystick Mode DISABLED. Navigation Resumed. <<<\r\n");
+                    } else {
+                        printf(">>> Joystick Mode is ALREADY Disabled. <<<\r\n");
                     }
-
-                    // 2. Resume autonomous navigation
-                    if (local_navigation_task_handler != NULL) {
-                        vTaskResume(local_navigation_task_handler);
-                    }
-                    printf(">>> Joystick Mode DISABLED. Navigation Resumed. <<<\r\n");
                 }
             }
             // --- ROUTE JOYSTICK PACKETS IF MODE IS ACTIVE ---
             else if (joystick_mode && strncmp(local_rx_buffer, "S:", 2) == 0) {
                 xQueueSend(xJoystickQueue, local_rx_buffer, 0);
             }
-            // --- EXISTING COMMANDS ---
+            // --- SYSTEM COMMANDS ---
             else if (strncmp(local_rx_buffer, "usb", 3) == 0) {
                 use_usb_logging = true;
                 printf("Switched to USB logging\r\n");
             }
-            else if (sscanf(local_rx_buffer, "p,%f,%f,%f", &p, &i, &d) == 3) {
-                speed_pid_A.Kp = p; speed_pid_A.Ki = i; speed_pid_A.Kd = d;
-                printf("PID Motor A updated\r\n");
+            // --- MOTOR A PID TUNING ---
+            else if (sscanf(local_rx_buffer, "pA,%f", &p) == 1) {
+                speed_pid_A.Kp = p;
+                printf("PID Motor_A P updated: %.3f\r\n", p);
             }
-            else if (sscanf(local_rx_buffer, "q,%f,%f,%f", &p, &i, &d) == 3) {
-                speed_pid_B.Kp = p; speed_pid_B.Ki = i; speed_pid_B.Kd = d;
-                printf("PID Motor B updated\r\n");
+            else if (sscanf(local_rx_buffer, "iA,%f", &i) == 1) {
+                speed_pid_A.Ki = i;
+                printf("PID Motor_A I updated: %.3f\r\n", i);
             }
+            else if (sscanf(local_rx_buffer, "dA,%f", &d) == 1) {
+                speed_pid_A.Kd = d;
+                printf("PID Motor_A D updated: %.3f\r\n", d);
+            }
+            // --- MOTOR B PID TUNING ---
+            else if (sscanf(local_rx_buffer, "pB,%f", &p) == 1) {
+                speed_pid_B.Kp = p;
+                printf("PID Motor_B P updated: %.3f\r\n", p);
+            }
+            else if (sscanf(local_rx_buffer, "iB,%f", &i) == 1) {
+                speed_pid_B.Ki = i;
+                printf("PID Motor_B I updated: %.3f\r\n", i);
+            }
+            else if (sscanf(local_rx_buffer, "dB,%f", &d) == 1) {
+                speed_pid_B.Kd = d;
+                printf("PID Motor_B D updated: %.3f\r\n", d);
+            }
+            // --- BOTH MOTORS BULK PID ---
             else if (sscanf(local_rx_buffer, "P,%f,%f,%f", &p, &i, &d) == 3) {
                 speed_pid_A.Kp = p; speed_pid_A.Ki = i; speed_pid_A.Kd = d;
                 speed_pid_B.Kp = p; speed_pid_B.Ki = i; speed_pid_B.Kd = d;
                 printf("PID Both Motors updated\r\n");
             }
-            else if (sscanf(local_rx_buffer, "c,%f,%f", &y, &t) == 2) {
-                K_y = y; K_theta = t;
-                printf("LQR updated\r\n");
+            else if (sscanf(local_rx_buffer, "wp,%f", &p) == 1) {
+                wall_pid.Kp = p;
+                printf("Wall PID P Wall updated: %.3f\r\n", p);
             }
+            else if (sscanf(local_rx_buffer, "wi,%f", &i) == 1) {
+                wall_pid.Ki = i;
+                printf("Wall PID I Wall updated: %.3f\r\n", i);
+            }
+            else if (sscanf(local_rx_buffer, "wd,%f", &d) == 1) {
+               wall_pid.Kd = d;
+               printf("Wall PID D Wall updated: %.3f\r\n", d);
+            }
+            // --- MOTOR STATE & SPEED ---
             else if (sscanf(local_rx_buffer, "M,%d", &m) == 1) {
-                if (m == 1) HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_SET);
-                else HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
-                printf("Motor State: %d\r\n", m);
+                if (m == 1) {
+                    if (is_robot_flipped) {
+                        motors_armed = false;
+                        printf("Cannot arm: robot is still detected as flipped.\r\n");
+                    } else {
+                        speed_pid_A.integral = 0.0f;
+                        speed_pid_A.prev_error = 0.0f;
+                        speed_pid_B.integral = 0.0f;
+                        speed_pid_B.prev_error = 0.0f;
+                        motors_armed = true;
+                        printf("Motor State: 1 (armed)\r\n");
+                    }
+                } else if (m == 0) {
+                    motors_armed = false;
+                    printf("Motor State: 0 (disarmed)\r\n");
+                }
             }
-            else if (sscanf(local_rx_buffer, "s,%f", &val) == 1) {
+            else if (sscanf(local_rx_buffer, "s,%f", &val) == 1 || sscanf(local_rx_buffer, "v,%f", &val) == 1) {
                 user_target_speed_ms = val;
                 printf("Target Speed Set: %.3f m/s\r\n", user_target_speed_ms);
             }
+            // --- FALLBACK ---
             else {
-                printf("Invalid format. Use: J,0/1 | P/p/q | c | m | s | usb\r\n");
+                printf("Invalid format. Use: J,0/1 | pA/iA/dA | pB/iB/dB | l | q | r | ky | kt | M | s/v | usb\r\n");
             }
         }
     }
 }
+
 
 void vDebugPrintTask(void *parameters)
 {
@@ -1784,6 +1655,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
         HAL_UART_Receive_IT(&huart1, &rx_data, 1);
     }
 }
+
+
 
 /* USER CODE END 4 */
 
