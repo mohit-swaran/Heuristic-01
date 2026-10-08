@@ -79,7 +79,6 @@ typedef struct {
     float max_output;   // Max steering adjustment limit
 } PID_Controller_t;
 
-
 static PID_Controller_t speed_pid_A = {
     .Kp = 3.5f,
     .Ki = 2.25f,
@@ -140,6 +139,18 @@ typedef struct {
 	float heading;
 }imu_pack_t;
 
+typedef struct {
+    tof_pack_t tof;
+    imu_pack_t imu;
+    float y_err;
+    float theta_err;
+    float v_cmd;
+    float omega_cmd;
+    int16_t encA;
+    int16_t encB;
+} telemetry_pack_t;
+
+
 VL53L0X_Dev_t sensor1 = { .addr = SENSOR_1_ADDR, .xshut_port = TOF1XSHUT_GPIO_Port, .xshut_pin = TOF1XSHUT_Pin, .stop_variable = 0,
 	    .distance_mm = 0};
 VL53L0X_Dev_t sensor2 = { .addr = SENSOR_2_ADDR, .xshut_port = TOF2XSHUT_GPIO_Port, .xshut_pin = TOF2XSHUT_Pin, .stop_variable = 0,
@@ -149,7 +160,6 @@ VL53L0X_Dev_t sensor3 = { .addr = SENSOR_3_ADDR, .xshut_port = TOF3XSHUT_GPIO_Po
 //Mag configs
 MMC5983MA_t myMag;
 ISM330DHCX_Object_t ism330dhcx_obj;
-SemaphoreHandle_t uartMutex;
 
 const float offset_x = -10.1f;
 const float offset_y = 21.00f - 5.50f;
@@ -167,18 +177,19 @@ double relative_heading = 0.0;
 QueueHandle_t xTofQueue;
 QueueHandle_t xUartRxQueue;
 QueueHandle_t xImuQueue;
+QueueHandle_t xTelemetryQueue;
+QueueHandle_t xJoystickQueue;
+
 BaseType_t xStatus;
+
 TaskHandle_t motor_task_handler;
 TaskHandle_t local_navigation_task_handler;
 TaskHandle_t orientation_task_handler;
-TaskHandle_t debug_task_handler;
+TaskHandle_t telemetry_task_handler;
+TaskHandle_t joystick_task_handler;
 
-QueueHandle_t xJoystickQueue;
-TaskHandle_t joystick_task_handler = NULL;
 volatile bool joystick_mode = false;
 
-//SemaphoreHandle_t xSpiBusMutex;
-//SemaphoreHandle_t xImuReadySem;
 
 /* GLOBAL STARTUP GATE FLAG */
 volatile uint8_t system_started = 0;
@@ -288,7 +299,7 @@ static void imu_task(void *parameters);
 static void xOrientationCheckTask(void *parameters);
 void vMotorController(void *parameters);
 void vLocalNavigationTask(void *parameters);
-void vDebugPrintTask(void *parameters);
+void vTelemetryTask(void *parameters);
 static void vJoystickTask(void *parameters);
 
 /* USER CODE END PFP */
@@ -430,17 +441,18 @@ int main(void)
 
     xTofQueue = xQueueCreate(1, sizeof(tof_pack_t));
     xImuQueue = xQueueCreate(1, sizeof(imu_pack_t));
+    xTelemetryQueue = xQueueCreate(1, sizeof(telemetry_pack_t));
     xUartRxQueue = xQueueCreate(5, 32);
     xJoystickQueue = xQueueCreate(5, 32);
-    uartMutex = xSemaphoreCreateMutex();
+
 
     status = xTaskCreate(tof_task, "TOFTask", 512, NULL, 2, &tof_task_handler);
     status = xTaskCreate(imu_task, "IMUTask", 512, NULL, 2, &imu_task_handler);
     status = xTaskCreate(main_task, "MainTask", 512, NULL, 2, &main_task_handler);
     status = xTaskCreate(xOrientationCheckTask, "orientationtask", 256, NULL, 1, &orientation_task_handler);
-    status = xTaskCreate(vLocalNavigationTask, "MainTask", 512, NULL, 2, &local_navigation_task_handler);
+    status = xTaskCreate(vLocalNavigationTask, "MainTask", 128, NULL, 2, &local_navigation_task_handler);
     status = xTaskCreate(vMotorController, "motorCtrl", 512, NULL, 2, &motor_task_handler);
-    status = xTaskCreate(vDebugPrintTask, "debug", 256, NULL, 2, &debug_task_handler);
+    status = xTaskCreate(vTelemetryTask, "Telemetry", 512, NULL, 2, &telemetry_task_handler);
 
     printf("Initialised TASKS \r\n");
 
@@ -1393,8 +1405,19 @@ void vLocalNavigationTask(void *parameters)
             uint32_t packed_value = ((uint32_t)(uint16_t)target_ticks_A << 16) | (uint16_t)target_ticks_B;
             xTaskNotify(motor_task_handler, packed_value, eSetValueWithOverwrite);
 
-            printf("%.1f,%.1f,%.1f,%.2f,%.,%.2f,%.2f,%.2f,%lu,%lu\n\r ",
-                                      y_left_tof, x_front_tof, y_right_tof, y_err, theta_err, v_cmd, omega_cmd, (unsigned long)latest_cntA, (unsigned long)latest_cntB);
+            telemetry_pack_t tel;
+            tel.tof = tof_data;
+			tel.imu = imu_data;
+			tel.y_err = y_err;
+			tel.theta_err = theta_err;
+			tel.v_cmd = v_cmd;
+			tel.omega_cmd = omega_cmd;
+			tel.encA = latest_cntA;
+			tel.encB = latest_cntB;
+
+			if (xTelemetryQueue != NULL) {
+				xQueueOverwrite(xTelemetryQueue, &tel);
+			}
         }
     }
 }
@@ -1451,8 +1474,7 @@ void CalcIK(float v, float ang_v, float *ang_R, float *ang_L){
 
 static void main_task(void *parameters){
     char local_rx_buffer[32];
-    float y, t, val;
-    float p, i, d;
+    float p, i, d, val;
     int m = 0;
 
     while(1) {
@@ -1570,27 +1592,26 @@ static void main_task(void *parameters){
 }
 
 
-void vDebugPrintTask(void *parameters)
+void vTelemetryTask(void *parameters)
 {
-    const TickType_t xFrequency = pdMS_TO_TICKS(50); // Print every 50ms (20 Hz)
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-
-    // Create a local pack to hold queued ToF data safely
-    tof_pack_t debug_tof;
+    telemetry_pack_t tel;
 
     while (1)
     {
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
-
-        // Peek at the ToF queue without blocking
-//        if (xQueuePeek(xTofQueue, &debug_tof, 0) == pdPASS) {
-//            printf("tof_l: %d | tof_f: %d | tof_r: %d | cA: %d | cB: %d\r\n",
-//                   debug_tof.y_left, debug_tof.x_front, debug_tof.y_right,
-//                   (int)latest_cntA, (int)latest_cntB);
-//        } else {
-            // Fallback print if queue isn't ready yet, showing at least encoders
-//            printf("cA: %d | cB: %d\r\n", (int)latest_cntA, (int)latest_cntB);
-//        }
+        // Block until the navigation task sends new data (runs at ~50Hz)
+        if (xQueueReceive(xTelemetryQueue, &tel, portMAX_DELAY) == pdPASS)
+        {
+            printf("%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%d,%d\r\n",
+                   tel.tof.y_left,
+                   tel.tof.x_front,
+                   tel.tof.y_right,
+                   tel.y_err,
+                   tel.theta_err,
+                   tel.v_cmd,
+                   tel.omega_cmd,
+                   (int)tel.encA,
+                   (int)tel.encB);
+        }
     }
 }
 
