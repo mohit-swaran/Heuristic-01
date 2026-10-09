@@ -62,9 +62,10 @@
 #define CHASSIS_LENGTH 		  0.10f
 #define WHEEL_RADIUS_M 		  (WHEEL_DIAMETER_M / 2)
 #define WHEEL_DIAMETER_M      0.034f      // 34 mm wheel diameter
-#define ENCODER_TICKS_PER_REV 410.0f     // Ticks per wheel revolution
+#define ENCODER_TICKS_PER_REV 750.0f // 410.f     // Ticks per wheel revolution
 #define METERS_TO_TICKS(v_ms) \
     ((int16_t)(((v_ms) / (M_PI * WHEEL_DIAMETER_M)) * ENCODER_TICKS_PER_REV))
+
 
 typedef void (*pFunction)(void);
 
@@ -140,8 +141,17 @@ typedef struct {
 }imu_pack_t;
 
 typedef struct {
+    float x;
+    float y;
+    float theta;
+    float v;
+    float omega;
+} robot_pose_t;
+
+typedef struct {
     tof_pack_t tof;
     imu_pack_t imu;
+    robot_pose_t pose;
     float y_err;
     float theta_err;
     float v_cmd;
@@ -150,6 +160,12 @@ typedef struct {
     int16_t encB;
 } telemetry_pack_t;
 
+typedef struct {
+    int16_t deltaA;
+    int16_t deltaB;
+    int16_t current_cntA; // Add this
+    int16_t current_cntB; // Add this
+} EncoderDeltas_t;
 
 VL53L0X_Dev_t sensor1 = { .addr = SENSOR_1_ADDR, .xshut_port = TOF1XSHUT_GPIO_Port, .xshut_pin = TOF1XSHUT_Pin, .stop_variable = 0,
 	    .distance_mm = 0};
@@ -160,6 +176,8 @@ VL53L0X_Dev_t sensor3 = { .addr = SENSOR_3_ADDR, .xshut_port = TOF3XSHUT_GPIO_Po
 //Mag configs
 MMC5983MA_t myMag;
 ISM330DHCX_Object_t ism330dhcx_obj;
+
+static robot_pose_t robot_pose = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
 const float offset_x = -10.1f;
 const float offset_y = 21.00f - 5.50f;
@@ -187,11 +205,13 @@ TaskHandle_t local_navigation_task_handler;
 TaskHandle_t orientation_task_handler;
 TaskHandle_t telemetry_task_handler;
 TaskHandle_t joystick_task_handler;
+TaskHandle_t odometry_task_handler;
 
 volatile bool joystick_mode = false;
 
 
 /* GLOBAL STARTUP GATE FLAG */
+volatile uint8_t reset_odom_flag = 0;
 volatile uint8_t system_started = 0;
 volatile bool is_robot_flipped = false;
 volatile float user_target_speed_ms = 0.0f;
@@ -284,8 +304,10 @@ void VL53L0X_Init_All(void);
 void Move_MotorA(int16_t magn);
 void Move_MotorB(int16_t magn);
 float Compute_PID(PID_Controller_t *pid, float error, float dt);
+void UpdateOdometry(int16_t ticksA, int16_t ticksB, float dt);
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 void CalcIK(float v, float ang_v, float *ang_R, float *ang_L);
+static float normalize_angle(float angle);
 uint32_t get_us(void);
 void DWT_Init(void);
 
@@ -294,13 +316,15 @@ void DWT_Init(void);
 static void tof_task(void *parameters);
 static void main_task(void *parameters);
 static void imu_task(void *parameters);
-
-//void vPID_task(void *parameters);
 static void xOrientationCheckTask(void *parameters);
 void vMotorController(void *parameters);
 void vLocalNavigationTask(void *parameters);
 void vTelemetryTask(void *parameters);
 static void vJoystickTask(void *parameters);
+void vOdometryTask(void *parameters);
+
+void Reset_Odometry(void);
+
 
 /* USER CODE END PFP */
 
@@ -452,7 +476,7 @@ int main(void)
     status = xTaskCreate(xOrientationCheckTask, "orientationtask", 256, NULL, 1, &orientation_task_handler);
     status = xTaskCreate(vLocalNavigationTask, "MainTask", 128, NULL, 2, &local_navigation_task_handler);
     status = xTaskCreate(vMotorController, "motorCtrl", 512, NULL, 2, &motor_task_handler);
-    status = xTaskCreate(vTelemetryTask, "Telemetry", 512, NULL, 2, &telemetry_task_handler);
+    status = xTaskCreate(vTelemetryTask, "Telemetry", 512, NULL, 1, &telemetry_task_handler);
 
     printf("Initialised TASKS \r\n");
 
@@ -461,8 +485,10 @@ int main(void)
     HAL_UART_Receive_IT(&huart1, &rx_data, 1);
 
     configASSERT(status == pdPASS);
+    HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL);
+    HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
+    vTaskStartScheduler();
 
-  vTaskStartScheduler();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -916,6 +942,27 @@ void Reset_Locked_Sensor(VL53L0X_Dev_t *dev) {
     VL53L0X_Begin(dev);
 }
 
+EncoderDeltas_t Read_Encoder_Deltas(void) {
+    static uint16_t prev_cntA = 0;
+    static uint16_t prev_cntB = 0;
+
+    // Read counter as uint16_t matching timer register
+    uint16_t current_cntA = (uint16_t)__HAL_TIM_GET_COUNTER(&htim5);
+    uint16_t current_cntB = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+
+    EncoderDeltas_t deltas;
+    // Unsigned subtraction correctly handles overflow across 0/65535 bounds
+    deltas.deltaA = (int16_t)(prev_cntA - current_cntA);
+    deltas.deltaB = (int16_t)(prev_cntB - current_cntB);
+    deltas.current_cntA = current_cntA;
+    deltas.current_cntB = current_cntB;
+
+    prev_cntA = current_cntA;
+    prev_cntB = current_cntB;
+
+    return deltas;
+}
+
 static void tof_task(void *parameters) {
     tof_pack_t tof_processed;
     vTaskDelay(pdMS_TO_TICKS(3000));
@@ -1148,7 +1195,7 @@ static void vJoystickTask(void *parameters) {
 
                 uint32_t packed_value = ((uint32_t)(uint16_t)target_ticks_A << 16) | (uint16_t)target_ticks_B;
                 xTaskNotify(motor_task_handler, packed_value, eSetValueWithOverwrite);
-                printf("speed: %f | turn: %f | w1: %f| w2: %f \n\r",speed,boosted_turn,ang_L,ang_R);
+//                printf("speed: %f | turn: %f | w1: %f| w2: %f \n\r",speed,boosted_turn,ang_L,ang_R);
             }
         }
     }
@@ -1176,6 +1223,35 @@ float Compute_PID(PID_Controller_t *pid, float error, float dt)
     return output;
 }
 
+static float normalize_angle(float angle) {
+    while (angle > M_PI)  angle -= 2.0f * M_PI;
+    while (angle < -M_PI) angle += 2.0f * M_PI;
+    return angle;
+}
+
+void UpdateOdometry(int16_t ticksA, int16_t ticksB, float dt) {
+    if (dt <= 0.0f) return;
+
+    // Convert wheel tick deltas into linear distance traveled (meters)
+    float ds_R = ((float)ticksA / ENCODER_TICKS_PER_REV) * (M_PI * WHEEL_DIAMETER_M);
+    float ds_L = ((float)ticksB / ENCODER_TICKS_PER_REV) * (M_PI * WHEEL_DIAMETER_M);
+
+    // Linear translation (ds) and angular rotation (dtheta) deltas
+    float ds = (ds_R + ds_L) / 2.0f;
+    float dtheta = (ds_R - ds_L) / CHASSIS_LENGTH; // Fixed parenthesis grouping
+
+    // Mid-step orientation for arc-integration
+    float mid_theta = robot_pose.theta + (dtheta / 2.0f);
+
+    // Integrate position across global frame
+    robot_pose.x += ds * cosf(mid_theta); // Fixed: accumulate with +=
+    robot_pose.y += ds * sinf(mid_theta); // Fixed: accumulate with +=
+    robot_pose.theta = normalize_angle(robot_pose.theta + dtheta);
+
+    // Instantaneous body velocities
+    robot_pose.v = ds / dt;
+    robot_pose.omega = dtheta / dt;
+}
 
 void compute_wall_pid_velocity(float y_err, float dt, float *v_cmd, float *ang_cmd) {
     // 1. SET BASE VELOCITY
@@ -1199,72 +1275,84 @@ void compute_wall_pid_velocity(float y_err, float dt, float *v_cmd, float *ang_c
     *ang_cmd = steering_correction;
 }
 
-void vMotorController(void *parameters){
+//void vOdometryTask(void *parameters) {
+//    TickType_t xLastWakeTime = xTaskGetTickCount();
+//    const TickType_t xFrequency = pdMS_TO_TICKS(10); // 100 Hz
+//
+//    // Initialize previous counter state
+//    Read_Encoder_Deltas();
+//
+//    while (1) {
+//        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+//
+//        // Read deltas once per control loop
+//        EncoderDeltas_t deltas = Read_Encoder_Deltas();
+//
+//        // Update global pose integration
+//        UpdateOdometry(deltas.deltaA, deltas.deltaB, 0.010f);
+//    }
+//}
+void vMotorController(void *parameters) {
     uint32_t packed_value = 0;
     int16_t target_ticks_A = 0;
     int16_t target_ticks_B = 0;
 
-    static int32_t prev_cntA = 0;
-    static int32_t prev_cntB = 0;
-
     HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
-    HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL);
-    HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
+
+    // Initialize previous counter references before loop starts
+    Read_Encoder_Deltas();
 
     const float dt = 0.010f;
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xFrequency = pdMS_TO_TICKS(10);
 
-    while (1)
-    {
+    while (1) {
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
+        // Read hardware deltas ONCE per 10ms tick
+        EncoderDeltas_t deltas = Read_Encoder_Deltas();
+
+        // Pass the identical deltas to the Odometry integrator
+        UpdateOdometry(deltas.deltaA, deltas.deltaB, dt);
+
+        if (reset_odom_flag == 1) {
+                    Reset_Odometry();
+                }
+
+        latest_cntA = deltas.current_cntA;
+        latest_cntB = deltas.current_cntB;
+
         if (!motors_armed || is_robot_flipped) {
-                    /* Discard stale targets and prevent PID windup during disarm. */
-                    target_ticks_A = 0;
-                    target_ticks_B = 0;
-                    speed_pid_A.integral = 0.0f;
-                    speed_pid_A.prev_error = 0.0f;
-                    speed_pid_B.integral = 0.0f;
-                    speed_pid_B.prev_error = 0.0f;
+            target_ticks_A = 0;
+            target_ticks_B = 0;
+            speed_pid_A.integral = 0.0f;
+            speed_pid_A.prev_error = 0.0f;
+            speed_pid_B.integral = 0.0f;
+            speed_pid_B.prev_error = 0.0f;
 
-                    Move_MotorA(0);
-                    Move_MotorB(0);
-                    HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
+            Move_MotorA(0);
+            Move_MotorB(0);
+            HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
+            continue;
+        }
 
-                    /* Keep encoder deltas current while disarmed. */
-                    latest_cntA = (int16_t)__HAL_TIM_GET_COUNTER(&htim5);
-                    latest_cntB = (int16_t)__HAL_TIM_GET_COUNTER(&htim2);
-                    prev_cntA = latest_cntA;
-                    prev_cntB = latest_cntB;
-                    continue;
-                }
+        HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_SET);
 
-                HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_SET);
+        if (xTaskNotifyWait(0x00, ULONG_MAX, &packed_value, 0) == pdTRUE) {
+            target_ticks_A = (int16_t)(packed_value >> 16);
+            target_ticks_B = (int16_t)(packed_value & 0xFFFF);
+        }
 
-                if (xTaskNotifyWait(0x00, ULONG_MAX, &packed_value, 0) == pdTRUE) {
-                    target_ticks_A = (int16_t)(packed_value >> 16);
-                    target_ticks_B = (int16_t)(packed_value & 0xFFFF);
-                }
+        float actual_ticks_A = (float)deltas.deltaA / dt;
+        float actual_ticks_B = (float)deltas.deltaB / dt;
 
-                latest_cntA = (int16_t)__HAL_TIM_GET_COUNTER(&htim5);
-                latest_cntB = (int16_t)__HAL_TIM_GET_COUNTER(&htim2);
+        float error_A = (float)target_ticks_A - actual_ticks_A;
+        float error_B = (float)target_ticks_B - actual_ticks_B;
 
-                int16_t deltaA = (int16_t)prev_cntA - latest_cntA;
-                int16_t deltaB = (int16_t)prev_cntB - latest_cntB;
-                prev_cntA = latest_cntA;
-                prev_cntB = latest_cntB;
-
-                float actual_ticks_A = (float)deltaA / dt;
-                float actual_ticks_B = (float)deltaB / dt;
-                float error_A = (float)target_ticks_A - actual_ticks_A;
-                float error_B = (float)target_ticks_B - actual_ticks_B;
-
-                Move_MotorA((int16_t)Compute_PID(&speed_pid_A, error_A, dt));
-                Move_MotorB((int16_t)Compute_PID(&speed_pid_B, error_B, dt));
-
+        Move_MotorA((int16_t)Compute_PID(&speed_pid_A, error_A, dt));
+        Move_MotorB((int16_t)Compute_PID(&speed_pid_B, error_B, dt));
     }
 }
 
@@ -1403,9 +1491,15 @@ void vLocalNavigationTask(void *parameters)
             int16_t target_ticks_B = METERS_TO_TICKS(ang_L);
 
             uint32_t packed_value = ((uint32_t)(uint16_t)target_ticks_A << 16) | (uint16_t)target_ticks_B;
-            xTaskNotify(motor_task_handler, packed_value, eSetValueWithOverwrite);
+
+            if (!joystick_mode) {
+                            xTaskNotify(motor_task_handler, packed_value, eSetValueWithOverwrite);
+                        }
 
             telemetry_pack_t tel;
+            tel.pose.x = robot_pose.x;
+            tel.pose.y = robot_pose.y;
+			tel.pose.theta = robot_pose.theta;
             tel.tof = tof_data;
 			tel.imu = imu_data;
 			tel.y_err = y_err;
@@ -1466,6 +1560,17 @@ static void xOrientationCheckTask(void *parameters)
     }
 }
 
+void Reset_Odometry(void) {
+    robot_pose.x = 0.0f;
+    robot_pose.y = 0.0f;
+    robot_pose.theta = 0.0f;
+    robot_pose.v = 0.0f;
+    robot_pose.omega = 0.0f;
+
+    // Change the variable back to 0 after resetting as requested
+    reset_odom_flag = 0;
+}
+
 void CalcIK(float v, float ang_v, float *ang_R, float *ang_L){
 
 	*ang_R = (v + (ang_v * CHASSIS_LENGTH / 2.0)) ;
@@ -1475,7 +1580,7 @@ void CalcIK(float v, float ang_v, float *ang_R, float *ang_L){
 static void main_task(void *parameters){
     char local_rx_buffer[32];
     float p, i, d, val;
-    int m = 0;
+    int m, odo = 0;
 
     while(1) {
         if (xQueueReceive(xUartRxQueue, local_rx_buffer, portMAX_DELAY) == pdPASS) {
@@ -1485,7 +1590,7 @@ static void main_task(void *parameters){
                 if (m == 1) {
                     if (!joystick_mode) {
                         joystick_mode = true;
-                        if (local_navigation_task_handler != NULL) vTaskSuspend(local_navigation_task_handler);
+//                        if (local_navigation_task_handler != NULL) vTaskSuspend(local_navigation_task_handler);
                         if (joystick_task_handler == NULL) xTaskCreate(vJoystickTask, "JoystickTask", 512, NULL, 2, &joystick_task_handler);
                         else vTaskResume(joystick_task_handler);
 
@@ -1500,7 +1605,7 @@ static void main_task(void *parameters){
                     if (joystick_mode) {
                         joystick_mode = false;
                         if (joystick_task_handler != NULL) vTaskSuspend(joystick_task_handler);
-                        if (local_navigation_task_handler != NULL) vTaskResume(local_navigation_task_handler);
+//                        if (local_navigation_task_handler != NULL) vTaskResume(local_navigation_task_handler);
                         printf(">>> Joystick Mode DISABLED. Navigation Resumed. <<<\r\n");
                     } else {
                         printf(">>> Joystick Mode is ALREADY Disabled. <<<\r\n");
@@ -1583,6 +1688,12 @@ static void main_task(void *parameters){
                 user_target_speed_ms = val;
                 printf("Target Speed Set: %.3f m/s\r\n", user_target_speed_ms);
             }
+            else if (sscanf(local_rx_buffer, "odr,%d", &odo) == 1) {
+				if (odo == 1) {
+					reset_odom_flag = 1;
+					printf(">>> Odometry Reset Requested <<<\r\n");
+				}
+             }
             // --- FALLBACK ---
             else {
                 printf("Invalid format. Use: J,0/1 | pA/iA/dA | pB/iB/dB | l | q | r | ky | kt | M | s/v | usb\r\n");
@@ -1601,10 +1712,13 @@ void vTelemetryTask(void *parameters)
         // Block until the navigation task sends new data (runs at ~50Hz)
         if (xQueueReceive(xTelemetryQueue, &tel, portMAX_DELAY) == pdPASS)
         {
-            printf("%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%d,%d\r\n",
-                   tel.tof.y_left,
-                   tel.tof.x_front,
+            printf("%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d\r\n",
+                   tel.tof.y_left,       // Accessing nested struct
+                   tel.tof.x_front,      // Accessing nested struct
                    tel.tof.y_right,
+				   tel.pose.x,
+				   tel.pose.y,
+				   tel.pose.theta,
                    tel.y_err,
                    tel.theta_err,
                    tel.v_cmd,
