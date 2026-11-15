@@ -1,8 +1,11 @@
 # Heuristic-01 - Autonomous Mazesolving Robot
 
-<img src="https://github.com/user-attachments/assets/18340c36-3ac3-4ed2-8062-c1b23e79f355" width="360"/>
+<!-- <img width="400" height="100" alt="Heuristic-01 Banner" src="https://github.com/user-attachments/assets/9ca6bb66-2699-4639-bf0a-2611bc1b7f54" /> -->
+![MuJoCo](https://img.shields.io/badge/Simulator-MuJoCo-1B4298?style=for-the-badge&logo=mujoco&logoColor=white)
+![FreeRTOS](https://img.shields.io/badge/RTOS-FreeRTOS-8CC63F?style=for-the-badge) ![STM32](https://img.shields.io/badge/MCU-STM32F411-03234B?style=for-the-badge&logo=stmicroelectronics&logoColor=white) ![C++](https://img.shields.io/badge/Language-C%2FC%2B%2B-00599C?style=for-the-badge&logo=cplusplus&logoColor=white)
+<!-- <img src="https://github.com/user-attachments/assets/18340c36-3ac3-4ed2-8062-c1b23e79f355" width="360"/> -->
 
-<img width="476" height="360" alt="gifheuristic" src="https://github.com/user-attachments/assets/ba580f9e-31a7-4238-9db8-246dba9c609e" />
+<!-- <img width="476" height="360" alt="gifheuristic" src="https://github.com/user-attachments/assets/ba580f9e-31a7-4238-9db8-246dba9c609e" /> -->
 
 ## Hardware Architecture
 * **Microcontroller:** STM32 (configured via STM32CubeIDE)
